@@ -62,6 +62,7 @@
  mechanism does not establish real-world structural or lifting safety.
 */
 
+
 import SwiftUI
 import SceneKit
 import UIKit
@@ -77,7 +78,7 @@ struct ContentView: View {
         VStack(spacing: 0) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("PYRAMID BOOM LIFT")
+                    Text("PYRAMID BOOM LIFT — 210 COURSES")
                         .font(.headline.bold())
 
                     Text("Four lifts • Four stockpiles • Counterweight roof haul")
@@ -195,7 +196,7 @@ struct ContentView: View {
             HStack {
                 Text("0.25×")
                 Spacer()
-                Text("2.5×")
+                Text("500×")
             }
             .font(.caption2)
             .foregroundStyle(.secondary)
@@ -221,8 +222,8 @@ struct ContentView: View {
 
             Text(
                 controller.engineeringMode
-                ? "Reach, moment, support, and overlap checks are enforced at placement."
-                : "Visual mode permits placements that fail reach or moment checks, but still reports the modeled geometry."
+                ? "Reach, moment, support, and overlap checks are enforced where modeled. Roof hauling is not mechanically validated."
+                : "Visual mode demonstrates placement and hauling paths without enforcing every engineering check."
             )
             .font(.caption)
             .foregroundStyle(.secondary)
@@ -295,9 +296,10 @@ struct ContentView: View {
             Text("Weight: W = m × g")
             Text("Ideal incline force: F = m × g × sin(θ)")
             Text("Gravitational work: E = m × g × Δh")
+            Text("Turning moment: M = F × r")
 
             Text(
-                "Rope tension, friction, pulley losses, braking, counterweight mass, anchor strength, and structural loads require a separate engineering model."
+                "Cable tension, pulley losses, braking, counterweight mass, anchor strength, and bearing loads require a separate force-coupled engineering model."
             )
             .font(.caption)
             .foregroundStyle(.secondary)
@@ -313,6 +315,8 @@ private struct StoneTarget: Identifiable {
     let position: SIMD3<Float>
     let size: SIMD3<Float>
     let isRoofSlab: Bool
+    let roofSlabIndex: Int?
+    let rotationZ: Float
 }
 
 private enum CranePhase {
@@ -357,13 +361,61 @@ private enum HaulStage {
 // MARK: - Construction controller
 
 final class PyramidConstructionController: ObservableObject {
-    @Published var status = "Initializing"
+
+    // MARK: 210-course geometry
+
+    private let courses = 210
+    private let courseHeight: Float = 0.15
+    private let spacing: Float = 0.82
+    private let baseHalfCells = 30
+
+    private let roofSlabCount = 5
+    private let roofMassKg: Float = 80_000
+
+    private let maximumReach: Float = 12
+    private let maximumMomentKNm: Float = 220
+
+    private var queenChamberStartCourse: Int { 58 }
+    private var queenChamberEndCourse: Int { 65 }
+
+    private var passageStartCourse: Int { 66 }
+    private var passageEndCourse: Int { 84 }
+
+    private var kingChamberStartCourse: Int { 85 }
+    private var roofSlabCourse: Int { 105 }
+
+    private func courseY(_ course: Int) -> Float {
+        0.22 + Float(course) * courseHeight
+    }
+
+    private var roofSlabElevation: Float {
+        courseY(roofSlabCourse)
+    }
+
+    // Exterior ramp endpoints and transfer position.
+    private let rampBase = SIMD3<Float>(-7.0, 0.55, 0)
+
+    private var queenTransfer: SIMD3<Float> {
+        SIMD3<Float>(-2.8, roofSlabElevation, 0)
+    }
+
+    private var pulleyPosition: SIMD3<Float> {
+        SIMD3<Float>(
+            -2.8,
+            roofSlabElevation + 0.7,
+            0
+        )
+    }
+
+    // MARK: Published UI state
+
+    @Published var status = "Initializing 210-course model"
     @Published var detail = "Preparing the foundation and four stockpiles."
 
     @Published var isRunning = true
     @Published var engineeringMode = false
-
     @Published var animationSpeed: Double = 1.0
+
     @Published var placedCount = 0
     @Published var totalCount = 0
     @Published var craneRows: [CraneRow] = []
@@ -372,29 +424,31 @@ final class PyramidConstructionController: ObservableObject {
         ("1", "Foundation and datum",
          "Establish the base and first course."),
         ("2", "Four corner stockpiles",
-         "Keep the stockpiles assigned to their respective lifts."),
-        ("3", "Ordinary course placement",
-         "Place blocks from the lowest incomplete course upward."),
-        ("4", "Chamber construction",
-         "Red chamber volumes are visual guides."),
-        ("5", "Reserve roof footprint",
-         "Keep the roof slab footprint clear of ordinary course-7 blocks."),
-        ("6", "Counterweight hauling",
-         "Animate the counterweight descending as the roof slab rises."),
-        ("7", "Slide slab inward",
-         "Transfer the slab at chamber height and slide it into position."),
-        ("8", "Verify roof placement",
-         "Run placement checks before committing the slab."),
-        ("9", "Resume upper courses",
-         "Continue ordinary block placement above the roof."),
-        ("10", "Finish and verify",
-         "Place all modeled targets.")
+         "Assign one stockpile to each lift."),
+        ("3", "Courses 1–58",
+         "Build the lower exterior courses while preserving the chamber geometry."),
+        ("4", "Queen's Chamber",
+         "Preserve the chamber void and its modeled course range."),
+        ("5", "Passage and King's Chamber",
+         "Keep the modeled passage and King's Chamber voids open."),
+        ("6", "Course 106 roof stage",
+         "Reserve the roof footprint and place five separate roof slabs at course 106."),
+        ("7", "Counterweight haul",
+         "Animate a slab traveling up the exterior ramp."),
+        ("8", "Inward roof transfer",
+         "Transfer the slab toward its roof target."),
+        ("9", "Upper courses",
+         "Resume ordinary placement after the roof targets are placed."),
+        ("10", "Completion",
+         "Verify that every generated target has been placed.")
     ]
 
     var progress: Double {
         guard totalCount > 0 else { return 0 }
         return Double(placedCount) / Double(totalCount)
     }
+
+    // MARK: Scene nodes
 
     let scene = SCNScene()
     let cameraNode = SCNNode()
@@ -415,19 +469,6 @@ final class PyramidConstructionController: ObservableObject {
     private var timer: AnyCancellable?
     private var nextID = 0
     private var singleStep = false
-
-    private let courses = 13
-    private let courseHeight: Float = 0.42
-    private let spacing: Float = 0.82
-
-    private let roofMassKg: Float = 80_000
-    private let maximumReach: Float = 12
-    private let maximumMomentKNm: Float = 220
-
-    // Illustrative exterior hauling route.
-    private let rampBase = SIMD3<Float>(-7.0, 0.55, 0)
-    private let queenTransfer = SIMD3<Float>(-2.8, 2.65, 0)
-    private let pulleyPosition = SIMD3<Float>(-2.8, 3.35, 0)
 
     private var counterweight: SCNNode?
     private var counterweightCable: SCNNode?
@@ -483,9 +524,9 @@ final class PyramidConstructionController: ObservableObject {
         world.addChildNode(sunNode)
 
         let ground = SCNBox(
-            width: 28,
+            width: 64,
             height: 0.15,
-            length: 28,
+            length: 64,
             chamferRadius: 0
         )
 
@@ -501,8 +542,8 @@ final class PyramidConstructionController: ObservableObject {
     private func configureCamera() {
         cameraNode.camera = SCNCamera()
         cameraNode.camera?.fieldOfView = 48
-        cameraNode.position = SCNVector3(17, 13, 21)
-        cameraNode.look(at: SCNVector3(0, 3, 0))
+        cameraNode.position = SCNVector3(34, 26, 42)
+        cameraNode.look(at: SCNVector3(0, 12, 0))
         scene.rootNode.addChildNode(cameraNode)
     }
 
@@ -537,33 +578,44 @@ final class PyramidConstructionController: ObservableObject {
     }
 
     private func addBeam(
-        _ parent: SCNNode,
-        from a: SIMD3<Float>,
-        to b: SIMD3<Float>,
+        _ rootNode: SCNNode,
+        from start: SIMD3<Float>,
+        to end: SIMD3<Float>,
         radius: CGFloat,
         color: UIColor
     ) -> SCNNode {
-        let delta = b - a
-        let length = max(0.01, simd_length(delta))
+        let vector = end - start
+        let beamLength = max(0.01, simd_length(vector))
 
-        let geometry = SCNCylinder(
+        let cylinder = SCNCylinder(
             radius: radius,
-            height: CGFloat(length)
+            height: CGFloat(beamLength)
         )
+        cylinder.materials = [mat(color)]
 
-        geometry.radialSegmentCount = 8
-        geometry.materials = [mat(color)]
+        let node = SCNNode(geometry: cylinder)
+        node.position = scn((start + end) / 2)
 
-        let node = SCNNode(geometry: geometry)
-        node.position = scn((a + b) / 2)
+        let up = SIMD3<Float>(0, 1, 0)
+        let direction = simd_normalize(vector)
+        let dotValue = max(-1, min(1, simd_dot(up, direction)))
+        let axis = simd_cross(up, direction)
+        let axisLength = simd_length(axis)
 
-        node.look(
-            at: scn(b),
-            up: SCNVector3(0, 1, 0),
-            localFront: SCNVector3(0, 1, 0)
-        )
+        if axisLength > 0.001 {
+            let normalizedAxis = simd_normalize(axis)
+            let angle = acos(dotValue)
+            node.rotation = SCNVector4(
+                normalizedAxis.x,
+                normalizedAxis.y,
+                normalizedAxis.z,
+                angle
+            )
+        } else if dotValue < 0 {
+            node.rotation = SCNVector4(1, 0, 0, Double.pi)
+        }
 
-        parent.addChildNode(node)
+        rootNode.addChildNode(node)
         return node
     }
 
@@ -575,24 +627,37 @@ final class PyramidConstructionController: ObservableObject {
         color: UIColor
     ) {
         let delta = b - a
-        let length = max(0.01, simd_length(delta))
+        let beamLength = max(0.01, simd_length(delta))
 
         let geometry = SCNCylinder(
             radius: radius,
-            height: CGFloat(length)
+            height: CGFloat(beamLength)
         )
-
         geometry.radialSegmentCount = 8
         geometry.materials = [mat(color)]
 
         node.geometry = geometry
         node.position = scn((a + b) / 2)
 
-        node.look(
-            at: scn(b),
-            up: SCNVector3(0, 1, 0),
-            localFront: SCNVector3(0, 1, 0)
-        )
+        let up = SIMD3<Float>(0, 1, 0)
+        let direction = simd_normalize(delta)
+        let dotValue = max(-1, min(1, simd_dot(up, direction)))
+        let axis = simd_cross(up, direction)
+        let axisLength = simd_length(axis)
+
+        if axisLength > 0.001 {
+            let normalizedAxis = simd_normalize(axis)
+            node.rotation = SCNVector4(
+                normalizedAxis.x,
+                normalizedAxis.y,
+                normalizedAxis.z,
+                acos(dotValue)
+            )
+        } else if dotValue < 0 {
+            node.rotation = SCNVector4(1, 0, 0, Double.pi)
+        } else {
+            node.rotation = SCNVector4(0, 0, 0, 0)
+        }
     }
 
     private func scn(_ position: SIMD3<Float>) -> SCNVector3 {
@@ -620,9 +685,9 @@ final class PyramidConstructionController: ObservableObject {
 
     private func buildFoundation() {
         let geometry = SCNBox(
-            width: 12,
+            width: CGFloat(Float(baseHalfCells * 2 + 1) * spacing),
             height: 0.18,
-            length: 12,
+            length: CGFloat(Float(baseHalfCells * 2 + 1) * spacing),
             chamferRadius: 0
         )
 
@@ -647,25 +712,47 @@ final class PyramidConstructionController: ObservableObject {
         nextID = 0
 
         for course in 0..<courses {
-            let y = 0.22 + Float(course) * courseHeight
-            let half = max(1, 6 - course / 2)
+            let y = courseY(course)
+            let taper = 1.0 - Float(course) / Float(courses - 1)
+
+            let half = max(
+                1,
+                Int(round(Float(baseHalfCells) * taper))
+            )
 
             for xCell in (-half)...half {
                 for zCell in (-half)...half {
                     let x = Float(xCell) * spacing
                     let z = Float(zCell) * spacing
 
-                    // Reserve the roof slab footprint on course 7.
-                    if course == 7 &&
-                        abs(x) <= 1.65 &&
-                        abs(z) <= 1.65 {
+                    // Reserve the roof footprint for dedicated slabs.
+                    if course == roofSlabCourse,
+                       abs(x) <= 1.65,
+                       abs(z) <= 1.65 {
                         continue
                     }
 
-                    // Reserve central interior space on courses 4–6.
-                    if (4...6).contains(course) &&
-                        abs(xCell) <= 1 &&
-                        abs(zCell) <= 1 {
+                    // Queen's Chamber void.
+                    if (queenChamberStartCourse...queenChamberEndCourse)
+                        .contains(course),
+                       abs(x) <= 1.23,
+                       abs(z) <= 1.23 {
+                        continue
+                    }
+
+                    // Connecting passage void.
+                    if (passageStartCourse...passageEndCourse)
+                        .contains(course),
+                       abs(x) <= 0.41,
+                       abs(z - 1.85) <= 0.41 {
+                        continue
+                    }
+
+                    // King's Chamber void beneath the roof.
+                    if (kingChamberStartCourse..<roofSlabCourse)
+                        .contains(course),
+                       abs(x) <= 1.23,
+                       abs(z) <= 1.23 {
                         continue
                     }
 
@@ -679,7 +766,9 @@ final class PyramidConstructionController: ObservableObject {
                                 courseHeight * 0.96,
                                 spacing * 0.96
                             ),
-                            isRoofSlab: false
+                            isRoofSlab: false,
+                            roofSlabIndex: nil,
+                            rotationZ: 0
                         )
                     )
 
@@ -687,32 +776,60 @@ final class PyramidConstructionController: ObservableObject {
                 }
             }
 
-            // One special roof slab, matching the original model.
-            if course == 7 {
-                targets.append(
-                    StoneTarget(
-                        id: nextID,
-                        course: 7,
-                        position: SIMD3<Float>(0, y, 0),
-                        size: SIMD3<Float>(2.7, courseHeight, 2.7),
-                        isRoofSlab: true
-                    )
-                )
+            // Five individual roof slabs at course 105.
+            if course == roofSlabCourse {
+                for slabIndex in 0..<roofSlabCount {
+                    let offset = Float(slabIndex) -
+                        Float(roofSlabCount - 1) / 2
 
-                nextID += 1
+                    let x = offset * 0.55
+                    let heightOffset =
+                        (1.0 - abs(offset) / 2.0) * 0.12
+
+                    let angle: Float
+                    if offset < 0 {
+                        angle = 0.22
+                    } else if offset > 0 {
+                        angle = -0.22
+                    } else {
+                        angle = 0
+                    }
+
+                    targets.append(
+                        StoneTarget(
+                            id: nextID,
+                            course: course,
+                            position: SIMD3<Float>(
+                                x,
+                                y + heightOffset,
+                                0
+                            ),
+                            size: SIMD3<Float>(
+                                0.58,
+                                0.45,
+                                2.8
+                            ),
+                            isRoofSlab: true,
+                            roofSlabIndex: slabIndex,
+                            rotationZ: angle
+                        )
+                    )
+
+                    nextID += 1
+                }
             }
         }
 
-        targets.sort {
-            if $0.course != $1.course {
-                return $0.course < $1.course
+        targets.sort { a, b in
+            if a.course != b.course {
+                return a.course < b.course
             }
 
-            if $0.isRoofSlab != $1.isRoofSlab {
-                return !$0.isRoofSlab
+            if a.isRoofSlab != b.isRoofSlab {
+                return !a.isRoofSlab
             }
 
-            return $0.id < $1.id
+            return a.id < b.id
         }
     }
 
@@ -723,53 +840,109 @@ final class PyramidConstructionController: ObservableObject {
             $0.removeFromParentNode()
         }
 
-        let lower = SCNBox(
+        // Queen's Chamber guide.
+        let queenBottom =
+            courseY(queenChamberStartCourse) - courseHeight / 2
+
+        let queenTop =
+            courseY(queenChamberEndCourse) + courseHeight / 2
+
+        let queenGeometry = SCNBox(
             width: 2.4,
-            height: 0.9,
+            height: CGFloat(max(courseHeight, queenTop - queenBottom)),
             length: 2.4,
             chamferRadius: 0
         )
 
-        lower.firstMaterial?.diffuse.contents = UIColor.red
-        lower.firstMaterial?.transparency = 0.34
+        queenGeometry.firstMaterial?.diffuse.contents = UIColor.red
+        queenGeometry.firstMaterial?.transparency = 0.34
+        queenGeometry.firstMaterial?.isDoubleSided = true
 
-        let lowerNode = SCNNode(geometry: lower)
-        lowerNode.position = SCNVector3(0, 1.8, 0)
-        chamberRoot.addChildNode(lowerNode)
+        let queenNode = SCNNode(geometry: queenGeometry)
+        queenNode.position = SCNVector3(
+            0,
+            (queenBottom + queenTop) / 2,
+            0
+        )
+        chamberRoot.addChildNode(queenNode)
 
-        let queen = SCNBox(
-            width: 2.25,
-            height: 1.15,
-            length: 2.25,
+        // King's Chamber guide, ending beneath the roof.
+        let kingBottom =
+            courseY(kingChamberStartCourse) - courseHeight / 2
+
+        let kingTop =
+            roofSlabElevation - courseHeight / 2
+
+        let kingGeometry = SCNBox(
+            width: 2.4,
+            height: CGFloat(max(courseHeight, kingTop - kingBottom)),
+            length: 2.4,
             chamferRadius: 0
         )
 
-        queen.firstMaterial?.diffuse.contents = UIColor.red
-        queen.firstMaterial?.transparency = 0.38
+        kingGeometry.firstMaterial?.diffuse.contents = UIColor.red
+        kingGeometry.firstMaterial?.transparency = 0.34
+        kingGeometry.firstMaterial?.isDoubleSided = true
 
-        let queenNode = SCNNode(geometry: queen)
-        queenNode.position = SCNVector3(0, 2.55, 0)
-        chamberRoot.addChildNode(queenNode)
+        let kingNode = SCNNode(geometry: kingGeometry)
+        kingNode.position = SCNVector3(
+            0,
+            (kingBottom + kingTop) / 2,
+            0
+        )
+        chamberRoot.addChildNode(kingNode)
+
+        // Connecting passage guide.
+        let passageBottom =
+            courseY(passageStartCourse) - courseHeight / 2
+
+        let passageTop =
+            courseY(passageEndCourse) + courseHeight / 2
 
         _ = addBox(
             chamberRoot,
-            SIMD3<Float>(0, 1.35, 1.85),
-            SIMD3<Float>(0.5, 0.35, 2.1),
+            SIMD3<Float>(
+                0,
+                (passageBottom + passageTop) / 2,
+                1.85
+            ),
+            SIMD3<Float>(
+                0.5,
+                max(courseHeight, passageTop - passageBottom),
+                0.5
+            ),
             UIColor.orange.withAlphaComponent(0.7)
         )
 
+        // Shaft guides.
         _ = addBeam(
             chamberRoot,
-            from: SIMD3<Float>(-0.55, 2.4, -0.55),
-            to: SIMD3<Float>(-1.6, 5.0, -1.6),
+            from: SIMD3<Float>(
+                -0.55,
+                kingBottom + 0.1,
+                -0.55
+            ),
+            to: SIMD3<Float>(
+                -1.6,
+                5.0,
+                -1.6
+            ),
             radius: 0.055,
             color: UIColor.green.withAlphaComponent(0.8)
         )
 
         _ = addBeam(
             chamberRoot,
-            from: SIMD3<Float>(0.55, 2.4, -0.55),
-            to: SIMD3<Float>(1.6, 5.0, -1.6),
+            from: SIMD3<Float>(
+                0.55,
+                kingBottom + 0.1,
+                -0.55
+            ),
+            to: SIMD3<Float>(
+                1.6,
+                5.0,
+                -1.6
+            ),
             radius: 0.055,
             color: UIColor.green.withAlphaComponent(0.8)
         )
@@ -800,15 +973,15 @@ final class PyramidConstructionController: ObservableObject {
             )
         }
 
-        // Track cross-ties.
-        for i in 0...8 {
-            let t = Float(i) / 8
-            let p = mix(rampBase, queenTransfer, t)
+        // Ramp cross-ties.
+        for index in 0...8 {
+            let t = Float(index) / 8
+            let point = mix(rampBase, queenTransfer, t)
 
             _ = addBeam(
                 counterweightRoot,
-                from: SIMD3<Float>(p.x, p.y, -0.5),
-                to: SIMD3<Float>(p.x, p.y, 0.5),
+                from: SIMD3<Float>(point.x, point.y, -0.5),
+                to: SIMD3<Float>(point.x, point.y, 0.5),
                 radius: 0.04,
                 color: wood
             )
@@ -818,8 +991,16 @@ final class PyramidConstructionController: ObservableObject {
         for z: Float in [-0.65, 0.65] {
             _ = addBeam(
                 counterweightRoot,
-                from: SIMD3<Float>(pulleyPosition.x, 2.35, z),
-                to: SIMD3<Float>(pulleyPosition.x, 3.8, z),
+                from: SIMD3<Float>(
+                    pulleyPosition.x,
+                    pulleyPosition.y - 1.0,
+                    z
+                ),
+                to: SIMD3<Float>(
+                    pulleyPosition.x,
+                    pulleyPosition.y + 0.45,
+                    z
+                ),
                 radius: 0.11,
                 color: wood
             )
@@ -829,7 +1010,6 @@ final class PyramidConstructionController: ObservableObject {
             ringRadius: 0.25,
             pipeRadius: 0.055
         )
-
         pulleyGeometry.materials = [mat(.darkGray)]
 
         let pulley = SCNNode(geometry: pulleyGeometry)
@@ -837,22 +1017,36 @@ final class PyramidConstructionController: ObservableObject {
         pulley.eulerAngles.x = .pi / 2
         counterweightRoot.addChildNode(pulley)
 
-        // Guides representing the Queen's Chamber counterweight path.
+        // Counterweight guide rails.
         for z: Float in [0.48, 1.02] {
             for x: Float in [-0.55, 0.55] {
                 _ = addBeam(
                     counterweightRoot,
-                    from: SIMD3<Float>(x, 1.55, z),
-                    to: SIMD3<Float>(x, 3.55, z),
+                    from: SIMD3<Float>(
+                        x,
+                        queenTransfer.y - 1.1,
+                        z
+                    ),
+                    to: SIMD3<Float>(
+                        x,
+                        pulleyPosition.y + 0.2,
+                        z
+                    ),
                     radius: 0.045,
                     color: wood
                 )
             }
         }
 
+        let initialWeightPosition = SIMD3<Float>(
+            0,
+            pulleyPosition.y - 0.35,
+            0.75
+        )
+
         counterweight = addBox(
             counterweightRoot,
-            SIMD3<Float>(0, 2.8, 0.75),
+            initialWeightPosition,
             SIMD3<Float>(0.8, 0.9, 0.8),
             UIColor(white: 0.32, alpha: 1)
         )
@@ -860,7 +1054,7 @@ final class PyramidConstructionController: ObservableObject {
         counterweightCable = addBeam(
             counterweightRoot,
             from: pulleyPosition,
-            to: SIMD3<Float>(0, 2.8, 0.75),
+            to: initialWeightPosition,
             radius: 0.025,
             color: .darkGray
         )
@@ -898,10 +1092,10 @@ final class PyramidConstructionController: ObservableObject {
         }
 
         let positions: [SIMD3<Float>] = [
-            SIMD3<Float>(-7.2, 0.2, -7.2),
-            SIMD3<Float>(7.2, 0.2, -7.2),
-            SIMD3<Float>(-7.2, 0.2, 7.2),
-            SIMD3<Float>(7.2, 0.2, 7.2)
+            SIMD3<Float>(-19, 0.2, -19),
+            SIMD3<Float>(19, 0.2, -19),
+            SIMD3<Float>(-19, 0.2, 19),
+            SIMD3<Float>(19, 0.2, 19)
         ]
 
         let colors: [UIColor] = [
@@ -942,13 +1136,13 @@ final class PyramidConstructionController: ObservableObject {
     private func stockPosition(_ index: Int) -> SIMD3<Float> {
         switch index {
         case 0:
-            return SIMD3<Float>(-7.2, 0.55, -7.2)
+            return SIMD3<Float>(-19, 0.55, -19)
         case 1:
-            return SIMD3<Float>(7.2, 0.55, -7.2)
+            return SIMD3<Float>(19, 0.55, -19)
         case 2:
-            return SIMD3<Float>(-7.2, 0.55, 7.2)
+            return SIMD3<Float>(-19, 0.55, 19)
         default:
-            return SIMD3<Float>(7.2, 0.55, 7.2)
+            return SIMD3<Float>(19, 0.55, 19)
         }
     }
 
@@ -962,10 +1156,10 @@ final class PyramidConstructionController: ObservableObject {
         cranes.removeAll()
 
         let bases: [SIMD3<Float>] = [
-            SIMD3<Float>(-6, 0.35, -6),
-            SIMD3<Float>(6, 0.35, -6),
-            SIMD3<Float>(-6, 0.35, 6),
-            SIMD3<Float>(6, 0.35, 6)
+            SIMD3<Float>(-16, 0.35, -16),
+            SIMD3<Float>(16, 0.35, -16),
+            SIMD3<Float>(-16, 0.35, 16),
+            SIMD3<Float>(16, 0.35, 16)
         ]
 
         let names = [
@@ -987,7 +1181,6 @@ final class PyramidConstructionController: ObservableObject {
             root.position = scn(bases[i])
             craneRoot.addChildNode(root)
 
-            // Lift base.
             _ = addBox(
                 root,
                 .zero,
@@ -995,7 +1188,6 @@ final class PyramidConstructionController: ObservableObject {
                 wood
             )
 
-            // Mast.
             _ = addBeam(
                 root,
                 from: SIMD3<Float>(0, 0.2, 0),
@@ -1076,7 +1268,6 @@ final class PyramidConstructionController: ObservableObject {
 
     func toggleRunning() {
         isRunning.toggle()
-
         status = isRunning
             ? "Construction resumed"
             : "Construction paused"
@@ -1119,6 +1310,10 @@ final class PyramidConstructionController: ObservableObject {
         placedNodes.removeAll()
         cranes.removeAll()
 
+        counterweight = nil
+        counterweightCable = nil
+        slabCable = nil
+
         buildFoundation()
         buildTargets()
         buildChambers()
@@ -1140,13 +1335,9 @@ final class PyramidConstructionController: ObservableObject {
     private func tick(_ dt: Float) {
         guard isRunning || singleStep else { return }
 
-        let effectiveDT: Float
-
-        if singleStep {
-            effectiveDT = 0.2
-        } else {
-            effectiveDT = dt * Float(animationSpeed)
-        }
+        let effectiveDT: Float = singleStep
+            ? 0.2
+            : dt * Float(animationSpeed)
 
         singleStep = false
 
@@ -1210,6 +1401,12 @@ final class PyramidConstructionController: ObservableObject {
                 chamfer: 0.015
             )
 
+            block.eulerAngles = SCNVector3(
+                0,
+                0,
+                target.rotationZ
+            )
+
             if target.isRoofSlab {
                 let frame = SCNBox(
                     width: CGFloat(target.size.x + 0.07),
@@ -1224,7 +1421,7 @@ final class PyramidConstructionController: ObservableObject {
                 block.addChildNode(SCNNode(geometry: frame))
 
                 status = "Preparing roof slab haul"
-                detail = "The special counterweight route handles this 80-ton slab."
+                detail = "Preparing an individual 80-ton roof slab."
             } else {
                 status = "Loading ordinary block"
                 detail = "\(cranes[i].name) loads from its assigned corner."
@@ -1234,23 +1431,29 @@ final class PyramidConstructionController: ObservableObject {
         }
     }
 
+    // MARK: Course-by-course scheduler
+
     private func nextTarget() -> StoneTarget? {
-        let available = targets.filter {
-            !placed.contains($0.id) &&
-            !reserved.contains($0.id)
+        // Determine the lowest course that still has unplaced targets,
+        // including targets currently reserved by another lift.
+        let unfinished = targets.filter {
+            !placed.contains($0.id)
         }
 
-        guard let lowest = available.map(\.course).min() else {
+        guard let lowestCourse = unfinished.map(\.course).min() else {
             return nil
         }
 
-        // A higher course is not released until every target in the
-        // current lowest unfinished course has been placed.
-        return available
-            .filter { $0.course == lowest }
-            .min {
-                simd_length($0.position) < simd_length($1.position)
-            }
+        // Only assign targets from this course. If all remaining targets
+        // are reserved, wait rather than advancing to a higher course.
+        let available = unfinished.filter {
+            $0.course == lowestCourse &&
+            !reserved.contains($0.id)
+        }
+
+        return available.min {
+            simd_length($0.position) < simd_length($1.position)
+        }
     }
 
     // MARK: Crane animation
@@ -1358,6 +1561,8 @@ final class PyramidConstructionController: ObservableObject {
         }
     }
 
+    // MARK: Roof slab hauling
+
     private func advanceRoofSlab(
         _ i: Int,
         _ target: StoneTarget,
@@ -1371,7 +1576,7 @@ final class PyramidConstructionController: ObservableObject {
 
         let raisedDestination = SIMD3<Float>(
             destination.x,
-            destination.y + 1.6,
+            destination.y + 0.35,
             destination.z
         )
 
@@ -1382,81 +1587,87 @@ final class PyramidConstructionController: ObservableObject {
         case .pickup:
             let t = smooth(cranes[i].elapsed / 0.8)
 
-            let p = mix(
+            let pickupPosition = mix(
                 stock,
                 stock + SIMD3<Float>(0, 0.25, 0),
                 t
             )
 
-            block.position = scn(p)
-            poseCrane(i, p)
+            block.position = scn(pickupPosition)
+            poseCrane(i, pickupPosition)
 
             if cranes[i].elapsed >= 0.8 {
                 setPhase(i, .lifting)
                 status = "Roof slab attached"
-                detail = "Moving the slab from the corner pickup toward the exterior haul track."
+                detail = "Moving the 80-ton slab toward the exterior hauling track."
             }
 
         case .lifting:
             let t = smooth(cranes[i].elapsed / 1.3)
-            let p = mix(stock, rampBase, t)
 
-            block.position = scn(p)
-            poseCrane(i, p)
+            let liftingPosition = mix(
+                stock,
+                rampBase,
+                t
+            )
+
+            block.position = scn(liftingPosition)
+            poseCrane(i, liftingPosition)
 
             if cranes[i].elapsed >= 1.3 {
                 setPhase(i, .hauling)
                 status = "Counterweight hauling"
-                detail = "The counterweight descends as the roof slab travels up the exterior route."
+                detail = "Animating the counterweight and slab along the exterior ramp."
             }
 
         case .hauling:
             let t = smooth(cranes[i].elapsed / 7.0)
-
-            let p: SIMD3<Float>
+            let slabPosition: SIMD3<Float>
 
             if t < 0.62 {
-                p = mix(
+                let rampProgress = t / 0.62
+                slabPosition = mix(
                     rampBase,
                     queenTransfer,
-                    t / 0.62
+                    rampProgress
                 )
 
                 status = "Counterweight hauling"
-                detail = "The roof slab is traveling up the exterior inclined track."
+                detail = "The slab is traveling up the exterior inclined track."
             } else {
-                p = mix(
+                let transferProgress = (t - 0.62) / 0.38
+                slabPosition = mix(
                     queenTransfer,
                     raisedDestination,
-                    (t - 0.62) / 0.38
+                    transferProgress
                 )
 
                 status = "Sliding roof slab inward"
-                detail = "The slab has reached transfer height and is moving toward the roof position."
+                detail = "The slab is moving from transfer height toward its roof position."
             }
 
-            block.position = scn(p)
-            poseCrane(i, p)
+            block.position = scn(slabPosition)
+            poseCrane(i, slabPosition)
 
-            // Counterweight descends while the slab advances.
-            let weightY = 3.15 - 1.7 * t
-
-            counterweight?.position = SCNVector3(
+            let weightY = pulleyPosition.y - 0.2 - 1.7 * t
+            let weightPosition = SIMD3<Float>(
                 0,
                 weightY,
                 0.75
             )
 
+            counterweight?.position = scn(weightPosition)
+
             updateCable(
                 counterweightCable,
                 from: pulleyPosition,
-                to: SIMD3<Float>(0, weightY, 0.75)
+                to: weightPosition
             )
 
             updateCable(
                 slabCable,
                 from: pulleyPosition,
-                to: p
+                to: slabPosition
             )
 
             if cranes[i].elapsed >= 7.0 {
@@ -1465,10 +1676,15 @@ final class PyramidConstructionController: ObservableObject {
 
         case .lowering:
             let t = smooth(cranes[i].elapsed / 1.2)
-            let p = mix(raisedDestination, destination, t)
 
-            block.position = scn(p)
-            poseCrane(i, p)
+            let loweringPosition = mix(
+                raisedDestination,
+                destination,
+                t
+            )
+
+            block.position = scn(loweringPosition)
+            poseCrane(i, loweringPosition)
 
             if cranes[i].elapsed >= 1.2 {
                 setPhase(i, .releasing)
@@ -1480,16 +1696,24 @@ final class PyramidConstructionController: ObservableObject {
             if cranes[i].elapsed >= 0.5 {
                 commit(target, block, i)
 
-                counterweight?.position = SCNVector3(
+                let resetWeightPosition = SIMD3<Float>(
                     0,
-                    2.8,
+                    pulleyPosition.y - 0.35,
                     0.75
                 )
+
+                counterweight?.position = scn(resetWeightPosition)
 
                 updateCable(
                     counterweightCable,
                     from: pulleyPosition,
-                    to: SIMD3<Float>(0, 2.8, 0.75)
+                    to: resetWeightPosition
+                )
+
+                updateCable(
+                    slabCable,
+                    from: pulleyPosition,
+                    to: queenTransfer
                 )
             }
         }
@@ -1503,7 +1727,7 @@ final class PyramidConstructionController: ObservableObject {
         cranes[i].elapsed = 0
     }
 
-    // MARK: Synchronized boom, brace, hook, and cable
+    // MARK: Boom, brace, hook, and cable animation
 
     private func poseCrane(
         _ i: Int,
@@ -1518,14 +1742,9 @@ final class PyramidConstructionController: ObservableObject {
         let boomVector = localLoad - pivot
         let distance = simd_length(boomVector)
 
-        guard distance > 0.01 else {
-            return
-        }
+        guard distance > 0.01 else { return }
 
         let direction = simd_normalize(boomVector)
-
-        // The visual arm follows the load but has a maximum drawn length.
-        // This is not a substitute for the reach/moment validation.
         let visualLength = min(distance, 12)
         let tip = pivot + direction * visualLength
 
@@ -1536,7 +1755,6 @@ final class PyramidConstructionController: ObservableObject {
             alpha: 1
         )
 
-        // Move the boom itself.
         updateBeam(
             cranes[i].boom,
             from: pivot,
@@ -1545,7 +1763,6 @@ final class PyramidConstructionController: ObservableObject {
             color: wood
         )
 
-        // Keep the supporting brace connected to the moving boom tip.
         updateBeam(
             cranes[i].brace,
             from: lowerBraceAnchor,
@@ -1554,11 +1771,9 @@ final class PyramidConstructionController: ObservableObject {
             color: wood
         )
 
-        // Place the hook below the load position.
         let hookPosition = localLoad + SIMD3<Float>(0, -0.25, 0)
         cranes[i].hook.position = scn(hookPosition)
 
-        // Keep the cable connected from the boom tip to the hook.
         updateBeam(
             cranes[i].cable,
             from: tip,
@@ -1597,6 +1812,11 @@ final class PyramidConstructionController: ObservableObject {
         }
 
         block.position = scn(target.position)
+        block.eulerAngles = SCNVector3(
+            0,
+            0,
+            target.rotationZ
+        )
 
         placed.insert(target.id)
         reserved.remove(target.id)
@@ -1607,8 +1827,8 @@ final class PyramidConstructionController: ObservableObject {
             : "Block placed"
 
         detail = target.isRoofSlab
-            ? "Roof slab committed. Ordinary construction can continue above it."
-            : "Course \(target.course) block placed."
+            ? "Roof slab committed at its modeled position."
+            : "Course \(target.course + 1) block placed."
 
         cranes[craneIndex].phase = .idle
         cranes[craneIndex].elapsed = 0
@@ -1639,8 +1859,6 @@ final class PyramidConstructionController: ObservableObject {
         let weightKN = mass * 9.81 / 1000
         let moment = weightKN * reach
 
-        // The special roof route bypasses the boom reach/moment gate.
-        // That does not mean the counterweight route is engineered or safe.
         let reachPass = target.isRoofSlab ||
             !engineeringMode ||
             reach <= maximumReach
@@ -1649,8 +1867,16 @@ final class PyramidConstructionController: ObservableObject {
             !engineeringMode ||
             moment <= maximumMomentKNm
 
-        let supportPass = target.course == 0 ||
-            hasSupport(target)
+        // The roof slab uses a simplified bearing test against the
+        // chamber side walls, rather than requiring support at its center.
+        let supportPass: Bool
+        if target.course == 0 {
+            supportPass = true
+        } else if target.isRoofSlab {
+            supportPass = hasRoofBearingSupport(target)
+        } else {
+            supportPass = hasSupport(target)
+        }
 
         let overlapPass = !hasOverlap(target)
 
@@ -1693,6 +1919,29 @@ final class PyramidConstructionController: ObservableObject {
 
             return footprintsOverlap(target, other)
         }
+    }
+
+    private func hasRoofBearingSupport(
+        _ target: StoneTarget
+    ) -> Bool {
+        // Simplified geometric check: require placed targets close to
+        // both sides of the chamber footprint at the supporting course.
+        let expectedY = courseY(roofSlabCourse - 1)
+        let tolerance = courseHeight * 1.5
+
+        let bearingTargets = targets.filter { other in
+            guard placed.contains(other.id),
+                  !other.isRoofSlab,
+                  abs(other.position.y - expectedY) <= tolerance else {
+                return false
+            }
+
+            return abs(other.position.x) >= 1.23 &&
+                abs(other.position.x) <= 2.5 &&
+                abs(other.position.z) <= 1.8
+        }
+
+        return !bearingTargets.isEmpty
     }
 
     private func hasOverlap(
